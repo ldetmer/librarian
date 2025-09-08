@@ -23,7 +23,7 @@ ls -al /output
 new_version=$(jq -r '.libraries[0].version' /librarian/release-init-request.json)
 echo "release version: ${new_version}"
 mkdir /output/internal/
-echo "${new_version}" > /output/internal/version.txt
+echo "0.1.3" > /output/internal/version.txt
 
 ls -al /output
 
