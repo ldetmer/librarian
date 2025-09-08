@@ -1,7 +1,0 @@
-repositories:
-  - name: "librarian"
-    full-name: https://github.com/ldetmer/librarian
-    github-token-secret-name: "librarian-github-token"
-    supported-commands:
-      - stage-release
-      - publish-release
