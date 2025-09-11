@@ -21,8 +21,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/googleapis/librarian/internal/conventionalcommits"
-
 	"github.com/googleapis/librarian/internal/docker"
 
 	"github.com/googleapis/librarian/internal/cli"
@@ -30,17 +28,38 @@ import (
 	"github.com/googleapis/librarian/internal/gitrepo"
 )
 
-const (
-	KeyClNum = "PiperOrigin-RevId"
-)
-
 // cmdInit is the command for the `release init` subcommand.
 var cmdInit = &cli.Command{
 	Short:     "init initiates a release by creating a release pull request.",
-	UsageLine: "librarian release init [arguments]",
-	Long: `The release init command is the primary entry point for initiating a release.
-It orchestrates the process of parsing commits, determining new versions, generating
-a changelog, and creating a release pull request.`,
+	UsageLine: "librarian release init [flags]",
+	Long: `The 'release init' command is the primary entry point for initiating
+a new release. It automates the creation of a release pull request by parsing
+conventional commits, determining the next semantic version for each library,
+and generating a changelog. Librarian is environment aware and will check if the
+current directory is the root of a librarian repository. If you are not
+executing in such a directory the '--repo' flag must be provided.
+
+This command scans the git history since the last release, identifies changes
+(feat, fix, BREAKING CHANGE), and calculates the appropriate version bump
+according to semver rules. It then delegates all language-specific file
+modifications, such as updating a CHANGELOG.md or bumping the version in a pom.xml, 
+to the configured language-specific container.
+
+By default, 'release init' leaves the changes in your local working directory
+for inspection. Use the '--push' flag to automatically commit the changes to
+a new branch and create a pull request on GitHub. The '--commit' flag may be
+used to create a local commit without creating a pull request; this flag is
+ignored if '--push' is also specified.
+
+Examples:
+  # Create a release PR for all libraries with pending changes.
+  librarian release init --push
+
+  # Create a release PR for a single library.
+  librarian release init --library=secretmanager --push
+
+  # Manually specify a version for a single library, overriding the calculation.
+  librarian release init --library=secretmanager --library-version=2.0.0 --push`,
 	Run: func(ctx context.Context, cfg *config.Config) error {
 		runner, err := newInitRunner(cfg)
 		if err != nil {
@@ -68,6 +87,7 @@ func init() {
 type initRunner struct {
 	cfg             *config.Config
 	repo            gitrepo.Repository
+	sourceRepo      gitrepo.Repository
 	state           *config.LibrarianState
 	librarianConfig *config.LibrarianConfig
 	ghClient        GitHubClient
@@ -84,14 +104,15 @@ func newInitRunner(cfg *config.Config) (*initRunner, error) {
 	}
 	return &initRunner{
 		cfg:             runner.cfg,
-		workRoot:        runner.workRoot,
 		repo:            runner.repo,
-		partialRepo:     filepath.Join(runner.workRoot, "release-init"),
+		sourceRepo:      runner.sourceRepo,
 		state:           runner.state,
 		librarianConfig: runner.librarianConfig,
-		image:           runner.image,
 		ghClient:        runner.ghClient,
 		containerClient: runner.containerClient,
+		workRoot:        runner.workRoot,
+		partialRepo:     filepath.Join(runner.workRoot, "release-init"),
+		image:           runner.image,
 	}, nil
 }
 
@@ -105,13 +126,21 @@ func (r *initRunner) run(ctx context.Context) error {
 		return err
 	}
 
+	if err := saveLibrarianState(r.repo.GetDir(), r.state); err != nil {
+		return err
+	}
+
 	commitInfo := &commitInfo{
 		cfg:           r.cfg,
 		state:         r.state,
 		repo:          r.repo,
+		sourceRepo:    r.sourceRepo,
 		ghClient:      r.ghClient,
 		commitMessage: "chore: create a release",
 		prType:        release,
+		// Newly created PRs from the `release init` command should have a
+		// `release:pending` GitHub tab to be tracked for release.
+		pullRequestLabels: []string{"release:pending"},
 	}
 	if err := commitAndPush(ctx, commitInfo); err != nil {
 		return fmt.Errorf("failed to commit and push: %w", err)
@@ -125,18 +154,19 @@ func (r *initRunner) runInitCommand(ctx context.Context, outputDir string) error
 	if err := os.MkdirAll(dst, 0755); err != nil {
 		return fmt.Errorf("failed to make directory: %w", err)
 	}
-	src := r.repo.GetDir()
 
+	src := r.repo.GetDir()
 	for _, library := range r.state.Libraries {
 		if r.cfg.Library != "" {
 			if r.cfg.Library != library.ID {
 				continue
 			}
+
 			// Only update one library with the given library ID.
-			if err := updateLibrary(r.repo, library, r.cfg.LibraryVersion); err != nil {
+			if err := r.updateLibrary(library); err != nil {
 				return err
 			}
-			if err := copyLibrary(dst, src, library); err != nil {
+			if err := copyLibraryFiles(r.state, dst, library.ID, src); err != nil {
 				return err
 			}
 
@@ -144,10 +174,10 @@ func (r *initRunner) runInitCommand(ctx context.Context, outputDir string) error
 		}
 
 		// Update all libraries.
-		if err := updateLibrary(r.repo, library, r.cfg.LibraryVersion); err != nil {
+		if err := r.updateLibrary(library); err != nil {
 			return err
 		}
-		if err := copyLibrary(dst, src, library); err != nil {
+		if err := copyLibraryFiles(r.state, dst, library.ID, src); err != nil {
 			return err
 		}
 	}
@@ -198,24 +228,28 @@ func (r *initRunner) runInitCommand(ctx context.Context, outputDir string) error
 
 // updateLibrary updates the given library in the following way:
 //
-// 1. Get the library's commit history in the given git repository.
+// 1. Update the library's previous version.
 //
-// 2. Override the library version if libraryVersion is not empty.
+// 2. Get the library's commit history in the given git repository.
 //
-// 3. Set the library's release trigger to true.
-func updateLibrary(repo gitrepo.Repository, library *config.LibraryState, libraryVersion string) error {
-	commits, err := GetConventionalCommitsSinceLastRelease(repo, library)
+// 3. Override the library version if libraryVersion is not empty.
+//
+// 4. Set the library's release trigger to true.
+func (r *initRunner) updateLibrary(library *config.LibraryState) error {
+	// Update the previous version, we need this value when creating release note.
+	library.PreviousVersion = library.Version
+	commits, err := GetConventionalCommitsSinceLastRelease(r.repo, library)
 	if err != nil {
 		return fmt.Errorf("failed to fetch conventional commits for library, %s: %w", library.ID, err)
 	}
 
-	library.Changes = coerceLibraryChanges(commits)
+	library.Changes = commits
 	if len(library.Changes) == 0 {
 		slog.Info("Skip releasing library since no eligible change is found", "library", library.ID)
 		return nil
 	}
 
-	nextVersion, err := NextVersion(commits, library.Version, libraryVersion)
+	nextVersion, err := NextVersion(commits, library.Version, r.cfg.LibraryVersion)
 	if err != nil {
 		return err
 	}
@@ -224,38 +258,6 @@ func updateLibrary(repo gitrepo.Repository, library *config.LibraryState, librar
 	library.ReleaseTriggered = true
 
 	return nil
-}
-
-func coerceLibraryChanges(commits []*conventionalcommits.ConventionalCommit) []*config.Change {
-	changes := make([]*config.Change, 0)
-	for _, commit := range commits {
-		clNum := ""
-		if cl, ok := commit.Footers[KeyClNum]; ok {
-			clNum = cl
-		}
-
-		changeType := getChangeType(commit)
-		changes = append(changes, &config.Change{
-			Type:       changeType,
-			Subject:    commit.Description,
-			Body:       commit.Body,
-			ClNum:      clNum,
-			CommitHash: commit.SHA,
-		})
-	}
-
-	return changes
-}
-
-// getChangeType gets the type of the commit, adding an escalation mark (!) if
-// it is a breaking change.
-func getChangeType(commit *conventionalcommits.ConventionalCommit) string {
-	changeType := commit.Type
-	if commit.IsBreaking {
-		changeType = changeType + "!"
-	}
-
-	return changeType
 }
 
 // copyGlobalAllowlist copies files in the global file allowlist excluding

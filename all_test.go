@@ -48,6 +48,7 @@ var ignoredExts = map[string]bool{
 	".md":         true,
 	".yml":        true,
 	".yaml":       true,
+	".txt":        true,
 }
 
 var ignoredDirs = []string{
@@ -184,10 +185,6 @@ func TestGodocLint(t *testing.T) {
 		// TODO(https://github.com/googleapis/librarian/issues/1510): fix test
 		"-exclude", "internal/sidekick",
 		"./...")
-}
-
-func TestCoverage(t *testing.T) {
-	rungo(t, "test", "-coverprofile=coverage.out", "./internal/...", "./cmd/...")
 }
 
 func rungo(t *testing.T, args ...string) {

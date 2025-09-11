@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	gogitConfig "github.com/go-git/go-git/v5/config"
@@ -703,7 +704,7 @@ func TestSearchPullRequests(t *testing.T) {
 			query: "is:pr is:open author:app/dependabot",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasPrefix(r.URL.Path, "/search/issues") {
-					if r.URL.Query().Get("q") != "is:pr is:open author:app/dependabot" {
+					if r.URL.Query().Get("q") != "repo:owner/repo is:pr is:open author:app/dependabot" {
 						t.Errorf("unexpected query: got %q", r.URL.Query().Get("q"))
 					}
 					fmt.Fprint(w, `{"items": [{"number": 1, "pull_request": {}}]}`)
@@ -1026,10 +1027,10 @@ func TestFindMergedPullRequestsWithPendingReleaseLabel(t *testing.T) {
 				if r.URL.Query().Get("state") != "closed" {
 					t.Errorf("unexpected state: got %q", r.URL.Query().Get("state"))
 				}
-				pr0 := github.PullRequest{Number: github.Ptr(0), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/0"), MergeCommitSHA: github.Ptr("sha456"), Labels: []*github.Label{{Name: github.Ptr("release:pending")}}}
+				pr0 := github.PullRequest{Number: github.Ptr(0), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/0"), MergedAt: &github.Timestamp{Time: time.Date(2025, time.September, 5, 20, 44, 59, 0, time.UTC)}, Labels: []*github.Label{{Name: github.Ptr("release:pending")}}}
 				pr1 := github.PullRequest{Number: github.Ptr(1), Labels: []*github.Label{{Name: github.Ptr("release:pending")}}}
 				pr2 := github.PullRequest{Number: github.Ptr(2), Labels: []*github.Label{{Name: github.Ptr("other-label")}}}
-				pr3 := github.PullRequest{Number: github.Ptr(3), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/3"), MergeCommitSHA: github.Ptr("sha123"), Merged: github.Ptr(true), Labels: []*github.Label{{Name: github.Ptr("release:pending")}}}
+				pr3 := github.PullRequest{Number: github.Ptr(3), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/3"), ClosedAt: &github.Timestamp{Time: time.Date(2025, time.September, 5, 20, 44, 59, 0, time.UTC)}, Labels: []*github.Label{{Name: github.Ptr("release:pending")}}}
 				prs := []*github.PullRequest{&pr0, &pr1, &pr2, &pr3}
 				b, err := json.Marshal(prs)
 				if err != nil {
@@ -1038,8 +1039,7 @@ func TestFindMergedPullRequestsWithPendingReleaseLabel(t *testing.T) {
 				fmt.Fprint(w, string(b))
 			},
 			wantPRs: []*PullRequest{
-				{Number: github.Ptr(0), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/0"), MergeCommitSHA: github.Ptr("sha456"), Labels: []*github.Label{{Name: github.Ptr("release:pending")}}},
-				{Number: github.Ptr(3), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/3"), MergeCommitSHA: github.Ptr("sha123"), Merged: github.Ptr(true), Labels: []*github.Label{{Name: github.Ptr("release:pending")}}},
+				{Number: github.Ptr(0), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/0"), MergedAt: &github.Timestamp{Time: time.Date(2025, time.September, 5, 20, 44, 59, 0, time.UTC)}, Labels: []*github.Label{{Name: github.Ptr("release:pending")}}},
 			},
 		},
 		{
@@ -1077,6 +1077,70 @@ func TestFindMergedPullRequestsWithPendingReleaseLabel(t *testing.T) {
 
 			if diff := cmp.Diff(test.wantPRs, prs); diff != "" {
 				t.Errorf("FindMergedPullRequestsWithPendingReleaseLabel() prs mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+func TestCreateTag(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name      string
+		tagName   string
+		commitSHA string
+		handler   http.HandlerFunc
+		wantErr   bool
+	}{
+		{
+			name:      "Success",
+			tagName:   "v1.2.3",
+			commitSHA: "abcdef123456",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					t.Errorf("unexpected method: got %s, want %s", r.Method, http.MethodPost)
+				}
+				wantPath := "/repos/owner/repo/git/refs"
+				if r.URL.Path != wantPath {
+					t.Errorf("unexpected path: got %s, want %s", r.URL.Path, wantPath)
+				}
+
+				var ref github.Reference
+				if err := json.NewDecoder(r.Body).Decode(&ref); err != nil {
+					t.Fatalf("failed to decode request body: %v", err)
+				}
+				if ref.Ref == nil || *ref.Ref != "refs/tags/v1.2.3" {
+					t.Errorf("unexpected ref: got %v, want %s", ref.Ref, "refs/tags/v1.2.3")
+				}
+				fmt.Fprint(w, `{"ref": "refs/tags/v1.2.3"}`)
+			},
+		},
+		{
+			name:      "API Error",
+			tagName:   "v1.2.3",
+			commitSHA: "abcdef123456",
+			handler:   func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			wantErr:   true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(test.handler)
+			defer server.Close()
+
+			repo := &Repository{Owner: "owner", Name: "repo"}
+			client, err := newClientWithHTTP("fake-token", repo, server.Client())
+			if err != nil {
+				t.Fatalf("newClientWithHTTP() error = %v", err)
+			}
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			err = client.CreateTag(context.Background(), test.tagName, test.commitSHA)
+
+			if test.wantErr {
+				if err == nil {
+					t.Errorf("CreateTag() err = nil, expected error")
+				}
+			} else if err != nil {
+				t.Errorf("CreateTag() err = %v, want nil", err)
 			}
 		})
 	}
