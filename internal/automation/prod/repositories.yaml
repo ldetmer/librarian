@@ -5,3 +5,11 @@ repositories:
     supported-commands:
       - stage-release
       - publish-release
+  - name: "google-cloud-python"
+    full-name: https://github.com/ldetmer/google-cloud-python
+    github-token-secret-name: "librarian-github-token"
+    supported-commands:
+      - generate
+      - stage-release
+      - publish-release
+
